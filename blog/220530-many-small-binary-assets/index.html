@@ -1,0 +1,101 @@
+<!doctype html><html lang="en"><head>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+	<link rel="stylesheet" href="../blog.css" />
+	<script src="../blog.js"></script>
+</head><body><div class="markdown">
+
+Many Small Binary Assets
+------
+
+*by Aph on May 30, 2022*
+
+I thought I would share this thing I'm trying to solve.  My situation is: Upon game load, I need to transfer hundreds of small binary blobs/files from server to browser.
+
+How I currently do this is: The client makes one request per 'file' to an expressjs endpoint like /files/zone/:id/elevations.  The browser fetches *hundreds* of these, which appear to the browser as files.  Each one is 676 bytes.  Over http/1, the header overhead is crazy.
+
+![](network-tab.png "Chrome Network tab")
+
+Background: Each of these 676 byte files is a carefully optimized 1000x1000ft area of North America continental data for elevation and landcover (ie heightmap and derived color).  These are streamed to browser visitors based on the player starting location - currently a fixed position.  ([Game link](https://earth.suncapped.com))
+
+I originally drafted this post in the [Javelin](https://javelin.games/introduction/) discord gamdev channel, but am moving it to the web in case it's generally interesting.  I've learned so much from blogs myself.
+
+### http/2
+
+http/2 would speed up this process because the requests are done over a single connection with maybe as little as [9 overhead bytes](https://stackoverflow.com/questions/42746364/performance-benefit-of-http-2-over-http-for-single-request) per request (~1% of my file size). 
+
+However, Cloudflare, which I use for IP proxying, [doesn't support http/2](https://community.cloudflare.com/t/http-2-and-origin-server/120964) from the origin server (my asset server).  So my server gets overloaded with http/1 requests (from Cloudflare) unless I use caching, and caching is a [hard thing](https://martinfowler.com/bliki/TwoHardThings.html).
+
+Cloudflare Railgun sounds like it would help somewhat, since the requests would happen locally and headers probably binary diff'ed out, but it requires a $200/mo business plan.  And it wouldn't really solve the problem; the express server would still have to respond to all those requests.  Internet roundtrip improvements but no server load improvement.
+
+I can't just host these binary blobs as files on a CDN like Amazon S3 or the new Cloudflare R2, because this data is dynamically pulled from the game database (postgres), and it changes all the time.  (Also unsuitable for caching!)
+
+### Websockets
+
+A websocket connection could solve this; the browser could connect to the asset server (named 'expressa'), then it could request assets one at a time.  Problem: TCP roundtrip time per request!  That has to be at least a few ms...okay I looked it up.  Austin TX to NYC is ~0.0081 light seconds, =8 milliseconds, *2 for roundtrip.  (Am I doing this right?  lol.) 16ms *500req = 4 seconds of overhead.  Way too much.
+
+### Websocket Push
+
+But wait!  We don't have to request each asset individually; with a websocket connection, we can request them all in one send, then the asset server can push back all of the binary together in one message.  I already do this for player position data on the game server (named 'proxima').  So in this case: 
+
+1. Asset server would send client a list of all asset ids for the area.
+2. Client would decide which assets it still needed, and send those filtered ids to server.
+3. Asset server would then push/stream the requested assets over websocket.
+
+Disadvantages: No caching, doesn't allow multiplexing (multiplexing is doing more than one transfer at a time).  But http/2 has almost the same weakness in practice; it has multiplexing but it's all saturating a single connection.  As for game loading, I don't (currently) see a disadvantage to loading assets linearly/serially.
+
+### Do we need to tar/pack files together?
+
+Compressed then packed, or packed then compressed?
+
+Well, asset 'groups' are constantly changing.  If someone adds a novel item to a zone, that changes the hash of any packed groups being sent.  The whole group would have to be re-packed any time something changed.  This isn't so bad for elevation/landcover data, which rarely changes (though landcover WILL change once we have farming).  This would be *very* bad for object meshes.  (Note, too that, object meshes can already be compressed using Google's Draco.)  
+
+So I think the answer is to compress items individually, and then pack (or stream) them.  
+
+With websockets, each send is a message, so individual files can be send without even needing packing.  What is the Websocket overhead?  It looks to me like it will be about 4 bytes per message, not bad!  https://hpbn.co/websocket/
+
+
+We will need to connect to asset server with WS, download a bunch of things, then drop that connection.  So that asset server doesn't have to maintain connectons for everyone.  I guess that means I will want to do requests in groups of assets, rather than individually.  In other words, rather than using Promises to load assets deep in a function, I should instead gather all needed asset ids upfront, fetch them all at once (temporary asset websocket session), then do processing on the results.
+
+### Identifying Packed Data
+
+One problem: How do I specify which data is being sent?  Without using JSON, it's just a binary blob.  If I sent zones this way, there would be no way to know the order (unless I saved that) - and it's worse for variable-length assets like compressed meshes.  
+
+That returns to using a protocol that handles binary data.  Ie not JSON.  
+(Unless I used entity ids?  No, I would still need lengths etc)
+
+
+
+https://github.com/3mcd/javelin/tree/next/packages/pack - javelin - fast but I need binary support
+https://github.com/msgpack/msgpack-javascript - messagepack official
+https://github.com/kriszyp/msgpackr - messagepack alternative, less mature, faster
+https://github.com/mtth/avsc - Avro for JS, requires browserify?, has major features I don't need "type inference, schema evolution, and remote procedure calls."
+https://github.com/google/flatbuffers/tree/master/ts - looks nice but complicated and not js native https://google.github.io/flatbuffers/flatbuffers_support.html
+
+Some discussion fromo 2019: https://news.ycombinator.com/item?id=20604597
+
+
+### Going in Circles
+So - are Websockets even useful here, given we must use something like Messagepack anyway?  Why serve Messagepacked messages over Websocket instead of just HTTP/1?
+
+I guess that if there are several requests, that would be 3x the headers for HTTP/1.  Like if I requested meshes, terrain, landcover, all separately, that would be slower.  Or in a situation where assets were constantly coming into play, such that the client should remain permanently connected to the asset server.  But that has huge disadvantages for scaling.  Though at the point of scaling, assets from assetserver will need to be load balanced anyway.  Also, asset server will need to check sessions at some point.  Maybe doing a WS connect to BOTH asset and zone server at the same time would be a neat way to handle that?  Or maybe it would just add security holes.
+
+I'm not sure it solves any.  The advantage to Websocket was being able to request a lot of assets sequentially without having to re-establish a connection each time. 
+
+
+
+Is one WS advantage streams?  I could obviously stream, and I wonder if that is possible using HTTP.  
+I think Express can do streams too.  Also keep in mind:
+HTTP/1 = Express stream TO CF
+Websocket = WS stream TO BROWSER
+
+Hold on.  What about at the CF<->browser level?  There, which is faster?  
+Browser will multiplex it all from CF.  If CF has to fetch, maybe barely slower than WS.  
+
+Also, what about browser caching?  With WS, none.  With HTTP, optional.
+	(Could even do http caching by group hashes!)
+
+
+Actually Cloudflare Argo/Tunnels seems like it could be closer than Railgun.  But it looks complex as heck to set up.  Is this ALL for the sake of IP proxying?  What if I just didn't proxy expressa?
+
+
+

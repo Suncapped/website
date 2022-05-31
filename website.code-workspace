@@ -1,0 +1,19 @@
+{
+	"folders": [
+		{
+			"path": "."
+		}
+	],
+	"settings": {
+		"editor.inlineSuggest.enabled": true,
+		"editor.acceptSuggestionOnCommitCharacter": true,
+		"editor.wordBasedSuggestions": true,
+		"editor.quickSuggestions": {
+
+			"other": "off",
+			"comments": "off",
+			"strings": "off"
+		},
+		"editor.autoIndent": "none"
+	}
+}
